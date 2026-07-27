@@ -36,6 +36,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN playwright install chromium
 
-COPY hehe.py .
+COPY ui.py .
 
-CMD ["python", "hehe.py"]
+CMD ["python", "ui.py"]
